@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Read-Aloud</title>
+<style>
+  :root{--bg:#f6f5f2;--panel:#fff;--ink:#1d1d1f;--muted:#6b6b70;--accent:#2f6fed;--hl:rgba(255,200,0,.42);--line:#e3e2de}
+  @media (prefers-color-scheme:dark){:root{--bg:#18181a;--panel:#232326;--ink:#ececee;--muted:#9a9aa0;--accent:#6b9bff;--hl:rgba(255,200,0,.38);--line:#333337}}
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--ink)}
+  header{position:sticky;top:0;z-index:10;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  h1{font-size:16px;margin:0 12px 0 0}
+  button,select,label.file{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:7px 12px;cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button:disabled{opacity:.45;cursor:default}
+  label.file input{display:none}
+  #status{color:var(--muted);font-size:13px;margin-left:auto}
+  #bar{height:3px;background:var(--accent);width:0;transition:width .2s}
+  #drop{margin:40px auto;max-width:520px;border:2px dashed var(--line);border-radius:14px;padding:48px 20px;text-align:center;color:var(--muted)}
+  #drop.over{border-color:var(--accent);color:var(--accent)}
+  #pages{display:flex;flex-direction:column;align-items:center;gap:16px;padding:16px}
+  .page{position:relative;background:#fff;box-shadow:0 1px 6px rgba(0,0,0,.15);max-width:100%}
+  .page canvas{display:block;width:100%;height:auto}
+  .hl{position:absolute;background:var(--hl);border-radius:2px;pointer-events:none;mix-blend-mode:multiply}
+  .page{cursor:pointer}
+  #now{padding:8px 16px;background:var(--panel);border-bottom:1px solid var(--line);font-size:14px;min-height:20px;color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <h1>PDF Read-Aloud</h1>
+  <label class="file">Open PDF<input id="file" type="file" accept="application/pdf"></label>
+  <button id="play" class="primary" disabled>▶ Play</button>
+  <button id="stop" disabled>■ Stop</button>
+  <select id="voice" title="Voice">
+    <option value="af_heart">Heart (US female)</option>
+    <option value="af_bella">Bella (US female)</option>
+    <option value="am_michael">Michael (US male)</option>
+    <option value="am_fenrir">Fenrir (US male)</option>
+    <option value="bf_emma">Emma (UK female)</option>
+    <option value="bm_george">George (UK male)</option>
+  </select>
+  <select id="speed" title="Speed">
+    <option value="0.85">0.85×</option><option value="1" selected>1×</option>
+    <option value="1.15">1.15×</option><option value="1.3">1.3×</option>
+  </select>
+  <button id="export" disabled title="Generate the whole document and save as WAV">⬇ Save audio</button>
+  <span id="status">Loading voice model…</span>
+</header>
+<div id="bar"></div>
+<div id="now"></div>
+<div id="drop">Drop a PDF here or click <b>Open PDF</b>.<br><small>Everything runs on your computer — the PDF is never uploaded.</small></div>
+<div id="pages"></div>
+
+<script type="module">
+import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs";
+import { KokoroTTS } from "https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm";
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs";
+
+const $ = id => document.getElementById(id);
+const status = t => $("status").textContent = t;
+let tts = null, sentences = [], cur = -1, playing = false, runId = 0;
+const cache = new Map();           // key -> Promise<{audio,sr}>
+let ctx = null, src = null;
+
+// ---------- Load local TTS model (Kokoro-82M, runs in-browser, cached after first download) ----------
+(async () => {
+  try {
+    const device = navigator.gpu ? "webgpu" : "wasm";
+    tts = await KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", {
+      dtype: device === "webgpu" ? "fp32" : "q8", device,
+      progress_callback: p => { if (p.status === "progress" && p.total) status(`Downloading voice model… ${Math.round(p.loaded/p.total*100)}%`); }
+    });
+    status(`Voice ready (${device})` + (sentences.length ? ` · ${sentences.length} sentences` : ""));
+    refresh();
+  } catch (e) { console.error(e); status("Voice model failed to load: " + e.message); }
+})();
+
+// ---------- PDF loading ----------
+$("file").onchange = e => e.target.files[0] && openPdf(e.target.files[0]);
+const drop = $("drop");
+["dragover","dragenter"].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave","drop"].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
+document.addEventListener("drop", e => { const f = e.dataTransfer.files[0]; if (f && f.type === "application/pdf") openPdf(f); });
+
+async function openPdf(file) {
+  stop(); cache.clear(); sentences = []; cur = -1;
+  $("pages").innerHTML = ""; drop.style.display = "none";
+  status("Reading PDF…");
+  const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+  const width = Math.min(900, window.innerWidth - 32);
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const base = page.getViewport({ scale: 1 });
+    const vp = page.getViewport({ scale: width / base.width });
+    const ratio = window.devicePixelRatio || 1;
+    const wrap = document.createElement("div"); wrap.className = "page";
+    wrap.style.width = vp.width + "px";
+    const canvas = document.createElement("canvas");
+    canvas.width = vp.width * ratio; canvas.height = vp.height * ratio;
+    wrap.appendChild(canvas); $("pages").appendChild(wrap);
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp, transform: ratio !== 1 ? [ratio,0,0,ratio,0,0] : null }).promise;
+    const tc = await page.getTextContent();
+    buildSentences(tc.items, vp, wrap);
+    wrap.onclick = ev => clickPage(wrap, ev);
+    status(`Reading PDF… page ${p}/${pdf.numPages}`);
+  }
+  status(`${pdf.numPages} pages · ${sentences.length} sentences` + (tts ? "" : " · waiting for voice model…"));
+  refresh();
+}
+
+// Map text items -> sentences, keeping the on-page rectangles of each piece
+function buildSentences(items, vp, wrap) {
+  let text = "", spans = [];
+  for (const it of items) {
+    if (!it.str) { if (it.hasEOL) text += " "; continue; }
+    const tx = pdfjsLib.Util.transform(vp.transform, it.transform);
+    const h = Math.hypot(tx[2], tx[3]);
+    const rect = { x: tx[4], y: tx[5] - h, w: it.width * vp.scale, h: h * 1.15 };
+    spans.push({ start: text.length, end: text.length + it.str.length, rect, len: it.str.length });
+    text += it.str + (it.hasEOL ? " " : "");
+  }
+  // Fix hyphenated line breaks, then split into sentences
+  const re = /[^.!?]+(?:[.!?]+["')\]]*|$)\s*/g;
+  let m;
+  while ((m = re.exec(text))) {
+    if (!m[0]) break;
+    const s0 = m.index, s1 = m.index + m[0].length;
+    const clean = m[0].replace(/-\s+(?=[a-z])/g, "").replace(/\s+/g, " ").trim();
+    if (!/[A-Za-z0-9]/.test(clean)) continue;
+    const rects = [];
+    for (const sp of spans) {
+      if (sp.end <= s0 || sp.start >= s1) continue;
+      const a = Math.max(s0, sp.start) - sp.start, b = Math.min(s1, sp.end) - sp.start;
+      rects.push({ x: sp.rect.x + sp.rect.w * a / sp.len, y: sp.rect.y, w: sp.rect.w * (b - a) / sp.len, h: sp.rect.h });
+    }
+    for (const chunk of splitLong(clean)) sentences.push({ text: chunk, rects, wrap });
+  }
+}
+function splitLong(s, max = 350) {
+  if (s.length <= max) return [s];
+  const out = []; let cur = "";
+  for (const part of s.split(/(?<=[,;:])\s+/)) {
+    if ((cur + " " + part).length > max && cur) { out.push(cur); cur = part; } else cur = cur ? cur + " " + part : part;
+  }
+  if (cur) out.push(cur);
+  return out.flatMap(c => c.length > max * 1.5 ? c.match(new RegExp(`.{1,${max}}(\\s|$)`, "g")) : [c]);
+}
+
+// ---------- Highlighting ----------
+function highlight(i) {
+  document.querySelectorAll(".hl").forEach(n => n.remove());
+  const s = sentences[i]; if (!s) { $("now").textContent = ""; return; }
+  for (const r of s.rects) {
+    const d = document.createElement("div"); d.className = "hl";
+    Object.assign(d.style, { left: r.x + "px", top: r.y + "px", width: r.w + "px", height: r.h + "px" });
+    s.wrap.appendChild(d);
+  }
+  $("now").textContent = s.text;
+  const first = s.wrap.querySelector(".hl");
+  if (first) first.scrollIntoView({ block: "center", behavior: "smooth" });
+  $("bar").style.width = ((i + 1) / sentences.length * 100) + "%";
+}
+function clickPage(wrap, ev) {
+  const b = wrap.getBoundingClientRect(), x = ev.clientX - b.left, y = ev.clientY - b.top;
+  const i = sentences.findIndex(s => s.wrap === wrap && s.rects.some(r => x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h));
+  if (i >= 0) play(i);
+}
+
+// ---------- Speech ----------
+const key = i => `${i}|${$("voice").value}|${$("speed").value}`;
+function synth(i) {
+  const k = key(i);
+  if (!cache.has(k)) cache.set(k, tts.generate(sentences[i].text, { voice: $("voice").value, speed: +$("speed").value })
+    .then(a => ({ audio: a.audio, sr: a.sampling_rate })));
+  return cache.get(k);
+}
+async function play(from) {
+  if (!tts || !sentences.length) return;
+  stopAudio(); const id = ++runId; playing = true; refresh();
+  ctx ||= new AudioContext(); await ctx.resume();
+  for (let i = from; i < sentences.length && id === runId; i++) {
+    cur = i; highlight(i);
+    status(`Speaking ${i + 1}/${sentences.length}`);
+    const clip = await synth(i);
+    for (let j = 1; j <= 2 && i + j < sentences.length; j++) synth(i + j);   // prefetch
+    if (id !== runId) return;
+    await new Promise(res => {
+      const buf = ctx.createBuffer(1, clip.audio.length, clip.sr);
+      buf.copyToChannel(clip.audio, 0);
+      src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination);
+      src.onended = res; src.start();
+    });
+  }
+  if (id === runId) { playing = false; cur = -1; status("Finished"); refresh(); }
+}
+function stopAudio() { if (src) { src.onended = null; try { src.stop(); } catch {} src = null; } }
+function pause() { runId++; stopAudio(); playing = false; status("Paused"); refresh(); }
+function stop() { runId++; stopAudio(); playing = false; cur = -1; highlight(-1); $("bar").style.width = 0; refresh(); }
+
+$("play").onclick = () => playing ? pause() : play(cur >= 0 ? cur : 0);
+$("stop").onclick = stop;
+$("voice").onchange = $("speed").onchange = () => { if (playing) play(cur); };
+document.addEventListener("keydown", e => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); $("play").click(); } });
+
+$("export").onclick = async () => {
+  const parts = []; let sr = 24000;
+  $("export").disabled = true;
+  for (let i = 0; i < sentences.length; i++) {
+    status(`Generating audio ${i + 1}/${sentences.length}…`);
+    const c = await synth(i); sr = c.sr; parts.push(c.audio, new Float32Array(Math.round(sr * 0.25)));
+  }
+  const total = parts.reduce((n, p) => n + p.length, 0), pcm = new Int16Array(total);
+  let o = 0; for (const p of parts) for (const v of p) pcm[o++] = Math.max(-1, Math.min(1, v)) * 0x7fff;
+  const hdr = new DataView(new ArrayBuffer(44)), w = (p, s) => [...s].forEach((c, k) => hdr.setUint8(p + k, c.charCodeAt(0)));
+  w(0,"RIFF"); hdr.setUint32(4, 36 + pcm.byteLength, true); w(8,"WAVEfmt "); hdr.setUint32(16,16,true); hdr.setUint16(20,1,true);
+  hdr.setUint16(22,1,true); hdr.setUint32(24,sr,true); hdr.setUint32(28,sr*2,true); hdr.setUint16(32,2,true); hdr.setUint16(34,16,true);
+  w(36,"data"); hdr.setUint32(40, pcm.byteLength, true);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([hdr, pcm], { type: "audio/wav" })); a.download = "pdf-audio.wav"; a.click();
+  status("Audio saved"); refresh();
+};
+
+function refresh() {
+  const ok = !!tts && sentences.length > 0;
+  $("play").disabled = !ok; $("stop").disabled = !ok; $("export").disabled = !ok;
+  $("play").textContent = playing ? "❚❚ Pause" : "▶ Play";
+}
+</script>
+</body>
+</html>
