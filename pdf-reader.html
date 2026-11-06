@@ -58,7 +58,7 @@
     <option value="0.85">0.85×</option><option value="1" selected>1×</option>
     <option value="1.15">1.15×</option><option value="1.3">1.3×</option>
   </select>
-  <button id="export" disabled title="Generate the whole document and save as WAV">⬇ Save audio</button>
+  <button id="export" disabled title="Generate the whole document and save as MP3">⬇ Save audio</button>
   <span id="status">Loading voice model…</span>
 </header>
 <div id="bar"></div>
@@ -92,6 +92,7 @@ const lib = {
   mammoth: () => script("https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js", "mammoth"),
   jszip:   () => script("https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js", "JSZip"),
   xlsx:    () => script("https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js", "XLSX"),
+  lame:    () => script("https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js", "lamejs"),
   tess:    () => script("https://cdn.jsdelivr.net/npm/tesseract.js@5.1.0/dist/tesseract.min.js", "Tesseract"),
   marked:  () => loaded.marked ||= import("https://cdn.jsdelivr.net/npm/marked@12.0.2/+esm").then(m => m.marked),
 };
@@ -380,12 +381,16 @@ $("export").onclick = async () => {
   }
   const total = parts.reduce((n, p) => n + p.length, 0), pcm = new Int16Array(total);
   let o = 0; for (const p of parts) for (const v of p) pcm[o++] = Math.max(-1, Math.min(1, v)) * 0x7fff;
-  const hdr = new DataView(new ArrayBuffer(44)), w = (p, s) => [...s].forEach((c, k) => hdr.setUint8(p + k, c.charCodeAt(0)));
-  w(0,"RIFF"); hdr.setUint32(4, 36 + pcm.byteLength, true); w(8,"WAVEfmt "); hdr.setUint32(16,16,true); hdr.setUint16(20,1,true);
-  hdr.setUint16(22,1,true); hdr.setUint32(24,sr,true); hdr.setUint32(28,sr*2,true); hdr.setUint16(32,2,true); hdr.setUint16(34,16,true);
-  w(36,"data"); hdr.setUint32(40, pcm.byteLength, true);
+  // Encode to MP3 (128 kbps mono) in the browser
+  status("Encoding MP3…");
+  const enc = new (await lib.lame()).Mp3Encoder(1, sr, 128), mp3 = [];
+  for (let k = 0; k < pcm.length; k += 1152 * 20) {
+    const b = enc.encodeBuffer(pcm.subarray(k, k + 1152 * 20)); if (b.length) mp3.push(new Uint8Array(b));
+    if (k % (1152 * 2000) === 0) { status(`Encoding MP3… ${Math.round(k / pcm.length * 100)}%`); await new Promise(r => setTimeout(r)); }
+  }
+  const end = enc.flush(); if (end.length) mp3.push(new Uint8Array(end));
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([hdr, pcm], { type: "audio/wav" })); a.download = "read-aloud.wav"; a.click();
+  a.href = URL.createObjectURL(new Blob(mp3, { type: "audio/mpeg" })); a.download = "read-aloud.mp3"; a.click();
   status("Audio saved"); refresh();
 };
 
